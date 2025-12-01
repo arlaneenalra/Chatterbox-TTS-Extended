@@ -2,6 +2,9 @@
 __pycache__
 .mypy_cache/
 .venv/
+venv
+temp/
+output/
 
 # VS Code
 *.code-workspace

@@ -229,15 +229,19 @@ try:
     nltk.data.find('tokenizers/punkt')
 except LookupError:
     nltk.download('punkt')
-#try:
-#    nltk.data.find('tokenizers/punkt_tab')
-#except LookupError:
-#    nltk.download('punkt_tab')
+
+try:
+    #nltk.data.find('tokenizers/punkt_tab')
+    sent_tokenize("Is it loaded?")
+except LookupError:
+    nltk.download('punkt_tab')
 
 os.environ["CUDA_LAUNCH_BLOCKING"] = "0"
 
 # Select device: Apple Silicon GPU (MPS) if available, else fallback to CPU
-if torch.cuda.is_available():
+if "DEVICE" in os.environ:
+    DEVICE = os.environ["DEVICE"]
+elif torch.cuda.is_available():
     DEVICE = "cuda"
 elif torch.backends.mps.is_available():
     DEVICE = "mps"
