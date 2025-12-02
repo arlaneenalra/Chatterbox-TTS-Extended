@@ -17,6 +17,10 @@ conformer==0.3.2
 pyrnnoise==0.3.8
 soundfile
 nltk
+# OpenAI-compatible API dependencies
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6
 --extra-index-url=https://download.pytorch.org/whl/cu128
 torch==2.7.0
 torchaudio==2.7.0

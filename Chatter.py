@@ -239,8 +239,8 @@ os.environ["CUDA_LAUNCH_BLOCKING"] = "0"
 # Select device: Apple Silicon GPU (MPS) if available, else fallback to CPU
 if torch.cuda.is_available():
     DEVICE = "cuda"
-elif torch.backends.mps.is_available():
-    DEVICE = "mps"
+#elif torch.backends.mps.is_available():
+#    DEVICE = "mps"
 else:
     DEVICE = "cpu"
 
@@ -1578,7 +1578,7 @@ def apply_settings_json(settings_json):
 
 
 
-def main(server_name=None, server_port=None, share=False):
+def main(server_name=None, server_port=None, share=False, enable_api=False):
     with gr.Blocks() as demo:
         gr.Markdown("# 🎧 Chatterbox TTS Extended")
         with gr.Tabs():
@@ -2064,11 +2064,41 @@ def main(server_name=None, server_port=None, share=False):
             )
 
         # Pass through host/port/share from CLI if provided
-        demo.launch(
-            server_name=server_name,
-            server_port=server_port,
-            share=share,
-        )
+        if enable_api:
+            # Mount FastAPI alongside Gradio
+            from fastapi import FastAPI
+            from fastapi.responses import RedirectResponse
+            from api import app as fastapi_app
+
+            print("[INFO] Starting with OpenAI-compatible API enabled")
+            print(f"[INFO] Gradio UI will be available at: http://{server_name or '127.0.0.1'}:{server_port or 7860}/")
+            print(f"[INFO] API will be available at: http://{server_name or '127.0.0.1'}:{server_port or 7860}/v1/audio/speech")
+            print(f"[INFO] API docs available at: http://{server_name or '127.0.0.1'}:{server_port or 7860}/v1/docs")
+
+            # Create a new FastAPI app and properly mount both Gradio and API
+            combined_app = FastAPI(title="Chatterbox TTS")
+
+            # Mount API routes first at /v1
+            combined_app.mount("/v1", fastapi_app)
+
+            # Use Gradio's proper mounting function to mount at root
+            # This ensures all Gradio routes and static assets work correctly
+            combined_app = gr.mount_gradio_app(combined_app, demo, path="/")
+
+            # Launch with uvicorn
+            import uvicorn
+            uvicorn.run(
+                combined_app,
+                host=server_name or "127.0.0.1",
+                port=server_port or 7860
+            )
+        else:
+            # Original Gradio-only launch
+            demo.launch(
+                server_name=server_name,
+                server_port=server_port,
+                share=share,
+            )
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run Chatterbox-TTS Extended UI")
@@ -2077,6 +2107,8 @@ if __name__ == "__main__":
     parser.add_argument("--share", action="store_true", help="Enable Gradio share link")
     parser.add_argument("--public", action="store_true",
                         help="Shortcut for --host 0.0.0.0 (bind all interfaces)")
+    parser.add_argument("--enable-api", action="store_true",
+                        help="Enable OpenAI-compatible REST API alongside Gradio UI")
 
     args = parser.parse_args()
 
@@ -2084,4 +2116,4 @@ if __name__ == "__main__":
     if args.public and not args.host:
         args.host = "0.0.0.0"
 
-    main(server_name=args.host, server_port=args.port, share=args.share)
+    main(server_name=args.host, server_port=args.port, share=args.share, enable_api=args.enable_api)

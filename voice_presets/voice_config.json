@@ -1,0 +1,47 @@
+{
+  "voices": {
+    "alloy": {
+      "file": "alloy.wav",
+      "description": "Neutral, balanced voice",
+      "gender": "neutral",
+      "tags": ["professional", "clear"]
+    },
+    "echo": {
+      "file": "echo.wav",
+      "description": "Clear, resonant voice",
+      "gender": "male",
+      "tags": ["authoritative", "deep"]
+    },
+    "fable": {
+      "file": "fable.wav",
+      "description": "Expressive, narrative voice",
+      "gender": "female",
+      "tags": ["storytelling", "warm"]
+    },
+    "onyx": {
+      "file": "onyx.wav",
+      "description": "Deep, authoritative voice",
+      "gender": "male",
+      "tags": ["professional", "commanding"]
+    },
+    "nova": {
+      "file": "nova.wav",
+      "description": "Warm, friendly voice",
+      "gender": "female",
+      "tags": ["friendly", "approachable"]
+    },
+    "shimmer": {
+      "file": "shimmer.wav",
+      "description": "Bright, energetic voice",
+      "gender": "female",
+      "tags": ["youthful", "energetic"]
+    }
+  },
+  "default_voice": "alloy",
+  "voice_requirements": {
+    "sample_rate": 24000,
+    "format": "wav",
+    "duration_seconds": "10-30",
+    "notes": "Reference audio should be clear speech without background noise or music"
+  }
+}
