@@ -190,7 +190,7 @@ class ChatterboxTTS:
             speech_tokens = self.t3.inference(
                 t3_cond=conds_local.t3,
                 text_tokens=text_tokens,
-                max_new_tokens=1000,
+                max_new_tokens=3000,
                 temperature=temperature,
                 cfg_weight=cfg_weight,
                 generator=generator,
