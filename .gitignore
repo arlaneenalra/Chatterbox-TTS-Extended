@@ -4,6 +4,8 @@ __pycache__
 .venv/
 venv
 **.pyc
+temp/
+output/
 
 # VS Code
 *.code-workspace

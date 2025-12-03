@@ -1,0 +1,38 @@
+[project]
+name = "chatterbox-tts-extended"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "auto-editor==27.1.1",
+    "conformer==0.3.2",
+    "diffusers==0.29.0",
+    "faster-whisper>=1.2.0",
+    "ffmpeg-python>=0.2.0",
+    "gradio>=5.44.1",
+    "librosa==0.10.0",
+    "nltk>=3.9.1",
+    "numpy>=2.2.6",
+    "omegaconf==2.3.0",
+    "openai-whisper>=20250625",
+    "pyrnnoise==0.3.8",
+    "resampy==0.4.3",
+    "resemble-perth==1.0.1",
+    "s3tokenizer>=0.2.0",
+    "silero-vad==5.1.2",
+    "soundfile>=0.13.1",
+    "spaces>=0.40.1",
+    "torch==2.7.0",
+    "torchaudio==2.7.0",
+    "transformers==4.46.3",
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    "python-multipart>=0.0.6",
+    "torch==2.7.0",
+    "torchaudio==2.7.0"
+]
+
+[project.scripts]
+chatterbox = 'Chatter.py'
+
