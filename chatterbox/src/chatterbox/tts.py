@@ -284,7 +284,7 @@ class ChatterboxTTS:
             speech_tokens_batch = self.t3.inference_batch(
                 t3_cond=t3_cond,
                 text_tokens=text_tokens,
-                max_new_tokens=1000,
+                max_new_tokens=3000,
                 temperature=temperature,
                 cfg_weight=cfg_weight,
                 generator=generator,
