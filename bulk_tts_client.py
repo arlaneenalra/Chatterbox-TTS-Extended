@@ -569,11 +569,64 @@ def run_watch_mode(client: Client, input_dir: str, output_dir: str, pattern: str
         fn_index=fn_index
     )
 
+    # Process existing files before starting watch
+    print(f"\n{'='*70}")
+    print("WATCH MODE - INITIAL SCAN")
+    print(f"{'='*70}")
+    print(f"Scanning: {input_dir}")
+    print(f"Pattern: {pattern}")
+
+    input_path = Path(input_dir)
+    existing_files = sorted(input_path.glob(pattern))
+
+    if existing_files:
+        unprocessed_files = [f for f in existing_files if not tracker.is_processed(f)]
+
+        if unprocessed_files:
+            print(f"\nFound {len(unprocessed_files)} unprocessed file(s)")
+            print(f"{'='*70}\n")
+
+            for i, file_path in enumerate(unprocessed_files, 1):
+                print(f"[{i}/{len(unprocessed_files)}] Processing existing file: {file_path.name}")
+                try:
+                    output_files = process_text_file(
+                        client=client,
+                        text_file_path=str(file_path),
+                        output_dir=output_dir,
+                        settings=settings,
+                        audio_prompt_path=reference_audio,
+                        api_name=api_name,
+                        fn_index=fn_index
+                    )
+
+                    if output_files:
+                        print(f"[SUCCESS] Generated {len(output_files)} file(s)")
+                        tracker.mark_processed(file_path, True, output_files)
+                    else:
+                        print(f"[FAILED] No output generated")
+                        tracker.mark_processed(file_path, False, [], "No output files generated")
+
+                except Exception as e:
+                    print(f"[ERROR] Processing failed: {str(e)}")
+                    tracker.mark_processed(file_path, False, [], str(e))
+
+                print()
+
+            print(f"{'='*70}")
+            print("Initial scan complete")
+            print(f"{'='*70}\n")
+        else:
+            print(f"All {len(existing_files)} existing file(s) already processed")
+            print(f"{'='*70}\n")
+    else:
+        print(f"No existing files found")
+        print(f"{'='*70}\n")
+
     # Set up observer
     observer = Observer()
     observer.schedule(handler, input_dir, recursive=watch_args.get('recursive', False))
 
-    print(f"\n{'='*70}")
+    print(f"{'='*70}")
     print("WATCH MODE ACTIVE")
     print(f"{'='*70}")
     print(f"Watching: {input_dir}")
