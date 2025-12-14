@@ -569,12 +569,26 @@ def run_watch_mode(client: Client, input_dir: str, output_dir: str, pattern: str
         fn_index=fn_index
     )
 
-    # Process existing files before starting watch
+    # Start observer FIRST so it catches new files during initial scan
+    observer = Observer()
+    observer.schedule(handler, input_dir, recursive=watch_args.get('recursive', False))
+    observer.start()
+
     print(f"\n{'='*70}")
-    print("WATCH MODE - INITIAL SCAN")
+    print("WATCH MODE ACTIVE")
     print(f"{'='*70}")
-    print(f"Scanning: {input_dir}")
+    print(f"Watching: {input_dir}")
     print(f"Pattern: {pattern}")
+    print(f"Output: {output_dir}")
+    print(f"State file: {state_file}")
+    print(f"Watch delay: {watch_args['delay']} seconds")
+    print(f"Stability checks: {watch_args['stability_checks']} (interval: {watch_args['stability_interval']}s)")
+    print(f"{'='*70}\n")
+
+    # Now process existing files (observer is already running)
+    print(f"{'='*70}")
+    print("INITIAL SCAN - Processing existing files")
+    print(f"{'='*70}")
 
     input_path = Path(input_dir)
     existing_files = sorted(input_path.glob(pattern))
@@ -583,8 +597,7 @@ def run_watch_mode(client: Client, input_dir: str, output_dir: str, pattern: str
         unprocessed_files = [f for f in existing_files if not tracker.is_processed(f)]
 
         if unprocessed_files:
-            print(f"\nFound {len(unprocessed_files)} unprocessed file(s)")
-            print(f"{'='*70}\n")
+            print(f"Found {len(unprocessed_files)} unprocessed file(s)\n")
 
             for i, file_path in enumerate(unprocessed_files, 1):
                 print(f"[{i}/{len(unprocessed_files)}] Processing existing file: {file_path.name}")
@@ -616,29 +629,15 @@ def run_watch_mode(client: Client, input_dir: str, output_dir: str, pattern: str
             print("Initial scan complete")
             print(f"{'='*70}\n")
         else:
-            print(f"All {len(existing_files)} existing file(s) already processed")
+            print(f"All {len(existing_files)} existing file(s) already processed\n")
             print(f"{'='*70}\n")
     else:
-        print(f"No existing files found")
+        print(f"No existing files found\n")
         print(f"{'='*70}\n")
 
-    # Set up observer
-    observer = Observer()
-    observer.schedule(handler, input_dir, recursive=watch_args.get('recursive', False))
+    print("Now monitoring for new files...")
+    print(f"Press Ctrl+C to stop...\n")
 
-    print(f"{'='*70}")
-    print("WATCH MODE ACTIVE")
-    print(f"{'='*70}")
-    print(f"Watching: {input_dir}")
-    print(f"Pattern: {pattern}")
-    print(f"Output: {output_dir}")
-    print(f"State file: {state_file}")
-    print(f"Watch delay: {watch_args['delay']} seconds")
-    print(f"Stability checks: {watch_args['stability_checks']} (interval: {watch_args['stability_interval']}s)")
-    print(f"\nPress Ctrl+C to stop...")
-    print(f"{'='*70}\n")
-
-    observer.start()
     shutdown_handler = GracefulShutdown(observer)
 
     try:
