@@ -16,3 +16,4 @@ temp/
 test_outputs/
 **.wav
 settings.json
+.claude/

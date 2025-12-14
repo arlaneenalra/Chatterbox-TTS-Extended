@@ -126,6 +126,60 @@ pytest test_api.py -v
 # Outputs saved to: ./test_outputs/
 ```
 
+## Bulk TTS Client - Watch Mode
+
+The `bulk_tts_client.py` script supports two modes for processing text files:
+
+### Batch Mode (Default)
+Process all existing files in a directory once and exit:
+```bash
+python bulk_tts_client.py --input-dir ./texts --output-dir ./outputs
+```
+
+### Watch Mode (Continuous Processing)
+Continuously monitor a directory for new files and process them automatically:
+
+```bash
+# Basic watch mode
+python bulk_tts_client.py --watch --input-dir ./inbox --output-dir ./outputs
+
+# Watch with custom settings
+python bulk_tts_client.py --watch --input-dir ./inbox --output-dir ./outputs \
+    --settings my_settings.json --reference-audio voice.wav
+
+# Watch with longer stability delay (for slow network drives)
+python bulk_tts_client.py --watch --input-dir ./inbox --output-dir ./outputs \
+    --watch-delay 5.0 --stability-checks 5 --stability-interval 2.0
+
+# Reprocess files when modified
+python bulk_tts_client.py --watch --input-dir ./inbox --output-dir ./outputs \
+    --reprocess-modified
+```
+
+**Watch Mode Features:**
+- **File Stability Detection** - Waits for files to finish being written before processing
+- **State Tracking** - Tracks processed files to avoid reprocessing (stored in `watch_state.json`)
+- **Configurable Delays** - Adjust wait times and stability checks for different environments
+- **Graceful Shutdown** - Press Ctrl+C to stop (waits for active processing to complete)
+
+**Watch Mode Arguments:**
+- `--watch` - Enable watch mode
+- `--watch-delay SECONDS` - Initial delay after file detection (default: 2.0)
+- `--stability-checks N` - Consecutive stability checks required (default: 3)
+- `--stability-interval SECONDS` - Interval between checks (default: 1.0)
+- `--watch-state-file PATH` - Custom state file location
+- `--reprocess-modified` - Reprocess files when content changes
+- `--watch-recursive` - Monitor subdirectories recursively
+
+**State Management:**
+Processed files are tracked in `<output-dir>/watch_state.json`. To reprocess all files, delete this file.
+
+**Requirements:**
+Watch mode requires the `watchdog` library:
+```bash
+uv sync  # or: uv add watchdog
+```
+
 ## Common Development Patterns
 
 ### Adding New Voice Presets

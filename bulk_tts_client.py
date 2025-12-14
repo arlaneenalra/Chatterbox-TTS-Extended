@@ -20,6 +20,10 @@ import sys
 from pathlib import Path
 from typing import Dict, Any, List
 import time
+import hashlib
+from datetime import datetime
+import signal
+import threading
 
 try:
     from gradio_client import Client, handle_file
@@ -27,6 +31,16 @@ except ImportError:
     print("Error: gradio_client library not found.")
     print("Please install it with: pip install gradio_client")
     sys.exit(1)
+
+# Conditional imports for watch mode
+try:
+    from watchdog.observers import Observer
+    from watchdog.events import FileSystemEventHandler
+    WATCHDOG_AVAILABLE = True
+except ImportError:
+    WATCHDOG_AVAILABLE = False
+    Observer = None
+    FileSystemEventHandler = None
 
 
 def load_settings(settings_path: str) -> Dict[str, Any]:
@@ -78,6 +92,233 @@ def get_default_settings() -> Dict[str, Any]:
         "sound_words_field": "",
         "separate_files_checkbox": False,
     }
+
+
+def is_file_stable(file_path: Path, stability_checks: int = 3,
+                   check_interval: float = 1.0) -> bool:
+    """
+    Check if file has finished being written by monitoring size stability.
+    Returns True if file size is unchanged for N consecutive checks.
+
+    Args:
+        file_path: Path to file to check
+        stability_checks: Number of consecutive checks with same size
+        check_interval: Seconds between size checks
+
+    Returns:
+        True if file appears stable and ready for processing
+    """
+    previous_size = -1
+    stable_count = 0
+
+    for _ in range(stability_checks * 2):  # Max attempts
+        try:
+            current_size = file_path.stat().st_size
+            if current_size == previous_size and current_size > 0:
+                stable_count += 1
+                if stable_count >= stability_checks:
+                    return True
+            else:
+                stable_count = 0
+                previous_size = current_size
+            time.sleep(check_interval)
+        except (OSError, FileNotFoundError):
+            return False
+
+    return False
+
+
+class ProcessedFilesTracker:
+    """Track which files have been processed to avoid reprocessing."""
+
+    def __init__(self, state_file: Path):
+        self.state_file = state_file
+        self.state = self._load_state()
+
+    def _load_state(self) -> Dict:
+        if self.state_file.exists():
+            with open(self.state_file, 'r') as f:
+                return json.load(f)
+        return {"version": "1.0", "processed_files": {}}
+
+    def _save_state(self):
+        with open(self.state_file, 'w') as f:
+            json.dump(self.state, f, indent=2)
+
+    def is_processed(self, file_path: Path) -> bool:
+        return str(file_path.absolute()) in self.state["processed_files"]
+
+    def mark_processed(self, file_path: Path, success: bool,
+                       output_files: List[str], error: str = None):
+        file_hash = self._compute_hash(file_path)
+        self.state["processed_files"][str(file_path.absolute())] = {
+            "hash": file_hash,
+            "processed_at": datetime.now().isoformat(),
+            "success": success,
+            "output_files": output_files,
+            "error_message": error
+        }
+        self._save_state()
+
+    @staticmethod
+    def _compute_hash(file_path: Path) -> str:
+        hasher = hashlib.sha256()
+        with open(file_path, 'rb') as f:
+            hasher.update(f.read())
+        return f"sha256:{hasher.hexdigest()}"
+
+
+class GracefulShutdown:
+    """Handle graceful shutdown on SIGINT/SIGTERM."""
+
+    def __init__(self, observer):
+        self.observer = observer
+        self.shutdown = False
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+
+    def _signal_handler(self, signum, frame):
+        if self.shutdown:
+            print("\n\nForce quit!")
+            sys.exit(1)
+        print("\n\nShutdown requested, stopping observer...")
+        print("(Press Ctrl+C again to force quit)")
+        self.shutdown = True
+        self.observer.stop()
+
+
+class TTSFileEventHandler(FileSystemEventHandler):
+    """Handle file system events for TTS processing."""
+
+    def __init__(self, client, output_dir, pattern, settings, tracker,
+                 watch_args, reference_audio=None, api_name=None, fn_index=None):
+        self.client = client
+        self.output_dir = output_dir
+        self.pattern = pattern
+        self.settings = settings
+        self.tracker = tracker
+        self.watch_args = watch_args
+        self.reference_audio = reference_audio
+        self.api_name = api_name
+        self.fn_index = fn_index
+        self.processing_files = set()  # Prevent double-processing
+
+        import fnmatch
+        self.pattern_regex = fnmatch.translate(pattern)
+
+    def on_created(self, event):
+        """Handle file creation events."""
+        if event.is_directory:
+            return
+
+        file_path = Path(event.src_path)
+        if not self._matches_pattern(file_path):
+            return
+
+        print(f"\n[DETECTED] New file: {file_path.name}")
+
+        # Process in separate thread to avoid blocking observer
+        thread = threading.Thread(target=self._process_file_safe, args=(file_path,))
+        thread.daemon = True
+        thread.start()
+
+    def on_modified(self, event):
+        """Handle file modification events (if --reprocess-modified)."""
+        if not self.watch_args.get('reprocess_modified', False):
+            return
+
+        if event.is_directory:
+            return
+
+        file_path = Path(event.src_path)
+        if not self._matches_pattern(file_path):
+            return
+
+        # Check if file hash changed
+        if self.tracker.is_processed(file_path):
+            try:
+                current_hash = ProcessedFilesTracker._compute_hash(file_path)
+                stored_info = self.tracker.state["processed_files"][str(file_path.absolute())]
+
+                if current_hash != stored_info["hash"]:
+                    print(f"\n[MODIFIED] File changed: {file_path.name}")
+                    thread = threading.Thread(target=self._process_file_safe, args=(file_path,))
+                    thread.daemon = True
+                    thread.start()
+            except (KeyError, OSError, FileNotFoundError):
+                pass  # Skip if can't compute hash or file not found
+
+    def _matches_pattern(self, file_path: Path) -> bool:
+        """Check if file matches the specified pattern."""
+        import re
+        return re.match(self.pattern_regex, file_path.name) is not None
+
+    def _process_file_safe(self, file_path: Path):
+        """Safely process a file with error handling and stability checks."""
+
+        file_key = str(file_path.absolute())
+        if file_key in self.processing_files:
+            print(f"[SKIP] Already processing: {file_path.name}")
+            return
+
+        self.processing_files.add(file_key)
+
+        try:
+            # Check if already processed
+            if self.tracker.is_processed(file_path) and \
+               not self.watch_args.get('reprocess_modified', False):
+                print(f"[SKIP] Already processed: {file_path.name}")
+                return
+
+            # Initial delay
+            delay = self.watch_args['delay']
+            print(f"[WAITING] {delay}s initial delay...")
+            time.sleep(delay)
+
+            # Check file still exists
+            if not file_path.exists():
+                print(f"[ERROR] File disappeared: {file_path.name}")
+                return
+
+            # Wait for file stability
+            print(f"[CHECKING] File stability...")
+            if not is_file_stable(
+                file_path,
+                stability_checks=self.watch_args['stability_checks'],
+                check_interval=self.watch_args['stability_interval']
+            ):
+                print(f"[ERROR] File not stable after timeout: {file_path.name}")
+                self.tracker.mark_processed(file_path, False, [], "File stability timeout")
+                return
+
+            # Process the file
+            print(f"[PROCESSING] Starting TTS generation...")
+            output_files = process_text_file(
+                client=self.client,
+                text_file_path=str(file_path),
+                output_dir=self.output_dir,
+                settings=self.settings,
+                audio_prompt_path=self.reference_audio,
+                api_name=self.api_name,
+                fn_index=self.fn_index
+            )
+
+            if output_files:
+                print(f"[SUCCESS] Generated {len(output_files)} file(s)")
+                self.tracker.mark_processed(file_path, True, output_files)
+            else:
+                print(f"[FAILED] No output generated")
+                self.tracker.mark_processed(file_path, False, [], "No output files generated")
+
+        except Exception as e:
+            print(f"[ERROR] Processing failed: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            self.tracker.mark_processed(file_path, False, [], str(e))
+
+        finally:
+            self.processing_files.discard(file_key)
+            print(f"\n[READY] Watching for new files...")
 
 
 def process_text_file(
@@ -221,6 +462,153 @@ def process_text_file(
         return []
 
 
+def run_batch_mode(client: Client, input_dir: str, output_dir: str, pattern: str,
+                   settings: Dict[str, Any], reference_audio: str = None,
+                   api_name: str = None, fn_index: int = None) -> Dict[str, Any]:
+    """
+    Run one-time batch processing (original behavior).
+    Extracted from existing main() loop.
+
+    Args:
+        client: Gradio client instance
+        input_dir: Input directory path
+        output_dir: Output directory path
+        pattern: File pattern to match
+        settings: Settings dictionary
+        reference_audio: Optional reference audio path
+        api_name: Optional API endpoint name
+        fn_index: Optional function index
+
+    Returns:
+        Dictionary with statistics (total, successful, failed)
+    """
+    input_path = Path(input_dir)
+
+    # Find all matching text files
+    text_files = sorted(input_path.glob(pattern))
+
+    if not text_files:
+        print(f"\nNo files matching pattern '{pattern}' found in {input_dir}")
+        return {"total": 0, "successful": 0, "failed": 0}
+
+    print(f"\nFound {len(text_files)} file(s) to process")
+    print(f"{'='*70}\n")
+
+    successful = 0
+    failed = 0
+
+    for i, text_file in enumerate(text_files, 1):
+        print(f"Processing file {i}/{len(text_files)}: {text_file.name}")
+        print(f"{'-'*70}")
+
+        try:
+            output_files = process_text_file(
+                client=client,
+                text_file_path=str(text_file),
+                output_dir=output_dir,
+                settings=settings,
+                audio_prompt_path=reference_audio,
+                api_name=api_name,
+                fn_index=fn_index
+            )
+
+            if output_files:
+                successful += 1
+                print(f"✓ Success: Generated {len(output_files)} file(s)")
+            else:
+                failed += 1
+                print(f"✗ Failed: No output generated")
+
+        except Exception as e:
+            failed += 1
+            print(f"✗ Error: {str(e)}")
+
+        print(f"{'='*70}\n")
+
+    # Print summary
+    print(f"\nProcessing complete!")
+    print(f"Total files: {len(text_files)}")
+    print(f"Successful: {successful}")
+    print(f"Failed: {failed}")
+
+    return {"total": len(text_files), "successful": successful, "failed": failed}
+
+
+def run_watch_mode(client: Client, input_dir: str, output_dir: str, pattern: str,
+                   settings: Dict[str, Any], watch_args: Dict[str, Any],
+                   reference_audio: str = None, api_name: str = None, fn_index: int = None):
+    """
+    Run continuous file watching mode.
+
+    Args:
+        client: Gradio client instance
+        input_dir: Input directory path to watch
+        output_dir: Output directory path
+        pattern: File pattern to match
+        settings: Settings dictionary
+        watch_args: Watch-specific arguments (delay, stability_checks, etc.)
+        reference_audio: Optional reference audio path
+        api_name: Optional API endpoint name
+        fn_index: Optional function index
+    """
+    # Initialize state tracker
+    state_file = Path(watch_args.get('state_file') or
+                      os.path.join(output_dir, 'watch_state.json'))
+    tracker = ProcessedFilesTracker(state_file)
+
+    # Create event handler
+    handler = TTSFileEventHandler(
+        client=client,
+        output_dir=output_dir,
+        pattern=pattern,
+        settings=settings,
+        tracker=tracker,
+        watch_args=watch_args,
+        reference_audio=reference_audio,
+        api_name=api_name,
+        fn_index=fn_index
+    )
+
+    # Set up observer
+    observer = Observer()
+    observer.schedule(handler, input_dir, recursive=watch_args.get('recursive', False))
+
+    print(f"\n{'='*70}")
+    print("WATCH MODE ACTIVE")
+    print(f"{'='*70}")
+    print(f"Watching: {input_dir}")
+    print(f"Pattern: {pattern}")
+    print(f"Output: {output_dir}")
+    print(f"State file: {state_file}")
+    print(f"Watch delay: {watch_args['delay']} seconds")
+    print(f"Stability checks: {watch_args['stability_checks']} (interval: {watch_args['stability_interval']}s)")
+    print(f"\nPress Ctrl+C to stop...")
+    print(f"{'='*70}\n")
+
+    observer.start()
+    shutdown_handler = GracefulShutdown(observer)
+
+    try:
+        while not shutdown_handler.shutdown:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        pass  # Handled by signal handler
+    finally:
+        # Wait for active processing to complete
+        print("Waiting for active processing to complete...")
+        timeout = 30
+        start_wait = time.time()
+
+        while handler.processing_files and (time.time() - start_wait < timeout):
+            time.sleep(0.5)
+
+        if handler.processing_files:
+            print(f"Warning: {len(handler.processing_files)} file(s) still processing")
+
+        observer.join(timeout=5)
+        print("Watch mode stopped.")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Bulk TTS processing client for Chatterbox-TTS-Extended",
@@ -303,6 +691,53 @@ Examples:
         help='List available API endpoints and exit'
     )
 
+    # Watch mode arguments
+    parser.add_argument(
+        '--watch',
+        action='store_true',
+        help='Enable watch mode - continuously monitor directory for new files'
+    )
+
+    parser.add_argument(
+        '--watch-delay',
+        type=float,
+        default=2.0,
+        help='Initial delay (seconds) after file creation before processing (default: 2.0)'
+    )
+
+    parser.add_argument(
+        '--stability-checks',
+        type=int,
+        default=3,
+        help='Number of consecutive file size checks for stability (default: 3)'
+    )
+
+    parser.add_argument(
+        '--stability-interval',
+        type=float,
+        default=1.0,
+        help='Interval (seconds) between stability checks (default: 1.0)'
+    )
+
+    parser.add_argument(
+        '--watch-state-file',
+        type=str,
+        default=None,
+        help='Path to state file for tracking processed files (default: <output-dir>/watch_state.json)'
+    )
+
+    parser.add_argument(
+        '--reprocess-modified',
+        action='store_true',
+        help='Reprocess files if modified (checks file hash)'
+    )
+
+    parser.add_argument(
+        '--watch-recursive',
+        action='store_true',
+        help='Watch subdirectories recursively (default: false)'
+    )
+
     args = parser.parse_args()
 
     # If --list-endpoints is specified, we don't need input/output dirs
@@ -332,16 +767,7 @@ Examples:
             print(f"Error: Reference audio file not found: {args.reference_audio}")
             sys.exit(1)
 
-        # Find all text files
-        input_path = Path(args.input_dir)
-        text_files = sorted(input_path.glob(args.pattern))
-
-        if not text_files:
-            print(f"No text files found matching pattern '{args.pattern}' in {args.input_dir}")
-            sys.exit(1)
-
-        print(f"\nFound {len(text_files)} text file(s) to process")
-        print(f"Output directory: {args.output_dir}")
+        print(f"\nOutput directory: {args.output_dir}")
         print(f"Gradio URL: {args.url}")
 
     # Connect to Gradio API
@@ -370,6 +796,17 @@ Examples:
 
     # If we're not just listing endpoints, proceed with processing
     if not args.list_endpoints:
+        # Check watchdog availability if watch mode requested
+        if args.watch and not WATCHDOG_AVAILABLE:
+            print("\n" + "="*70)
+            print("ERROR: Watch mode requires the 'watchdog' library")
+            print("="*70)
+            print("\nInstall it with:")
+            print("  uv sync")
+            print("\nOr manually:")
+            print("  uv add watchdog")
+            sys.exit(1)
+
         # Set up endpoint parameters
         api_name = args.api_name if args.api_name else "/lambda"
         fn_index = args.fn_index
@@ -382,58 +819,42 @@ Examples:
         else:
             print(f"\nUsing API endpoint: {api_name} (default)")
 
-        # Process each file
-        total_files = len(text_files)
-        successful = 0
-        failed = 0
-        all_outputs = []
+        # Branch on watch vs batch mode
+        if args.watch:
+            # Prepare watch-specific arguments
+            watch_args = {
+                'delay': args.watch_delay,
+                'stability_checks': args.stability_checks,
+                'stability_interval': args.stability_interval,
+                'state_file': args.watch_state_file,
+                'reprocess_modified': args.reprocess_modified,
+                'recursive': args.watch_recursive
+            }
 
-        print("\n" + "="*70)
-        print("Starting batch processing...")
-        print("="*70)
-
-        for idx, text_file in enumerate(text_files, 1):
-            print(f"\n[{idx}/{total_files}] Processing: {text_file.name}")
-
-            try:
-                output_files = process_text_file(
-                    client=client,
-                    text_file_path=str(text_file),
-                    output_dir=args.output_dir,
-                    settings=settings,
-                    audio_prompt_path=args.reference_audio,
-                    api_name=api_name,
-                    fn_index=fn_index,
-                )
-
-                if output_files:
-                    successful += 1
-                    all_outputs.extend(output_files)
-                else:
-                    failed += 1
-
-            except KeyboardInterrupt:
-                print("\n\nProcessing interrupted by user")
-                break
-            except Exception as e:
-                print(f"Unexpected error: {str(e)}")
-                failed += 1
-
-        # Summary
-        print("\n" + "="*70)
-        print("PROCESSING COMPLETE")
-        print("="*70)
-        print(f"Total files: {total_files}")
-        print(f"Successful: {successful}")
-        print(f"Failed: {failed}")
-        print(f"Output files: {len(all_outputs)}")
-        print(f"Output directory: {args.output_dir}")
-        print("="*70)
-
-        if all_outputs:
-            print("\nGenerated files:")
-            for output_file in all_outputs:
-                print(f"  - {output_file}")
+            # Run watch mode
+            run_watch_mode(
+                client=client,
+                input_dir=args.input_dir,
+                output_dir=args.output_dir,
+                pattern=args.pattern,
+                settings=settings,
+                watch_args=watch_args,
+                reference_audio=args.reference_audio,
+                api_name=api_name,
+                fn_index=fn_index
+            )
+        else:
+            # Run batch mode (existing behavior)
+            run_batch_mode(
+                client=client,
+                input_dir=args.input_dir,
+                output_dir=args.output_dir,
+                pattern=args.pattern,
+                settings=settings,
+                reference_audio=args.reference_audio,
+                api_name=api_name,
+                fn_index=fn_index
+            )
 
 
 if __name__ == "__main__":
