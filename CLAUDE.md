@@ -157,10 +157,12 @@ python bulk_tts_client.py --watch --input-dir ./inbox --output-dir ./outputs \
 ```
 
 **Watch Mode Features:**
+- **Queue-Based Processing** - Files are queued and processed sequentially (one at a time) to prevent overwhelming the API server
 - **File Stability Detection** - Waits for files to finish being written before processing
 - **State Tracking** - Tracks processed files to avoid reprocessing (stored in `watch_state.json`)
 - **Configurable Delays** - Adjust wait times and stability checks for different environments
-- **Graceful Shutdown** - Press Ctrl+C to stop (waits for active processing to complete)
+- **Queue Status Visibility** - Periodic status updates show queue size and current file being processed
+- **Graceful Shutdown** - Press Ctrl+C to stop (drains queue and completes pending files before exit)
 
 **Watch Mode Arguments:**
 - `--watch` - Enable watch mode
@@ -170,6 +172,8 @@ python bulk_tts_client.py --watch --input-dir ./inbox --output-dir ./outputs \
 - `--watch-state-file PATH` - Custom state file location
 - `--reprocess-modified` - Reprocess files when content changes
 - `--watch-recursive` - Monitor subdirectories recursively
+- `--max-queue-size N` - Maximum queue size, 0 = unlimited (default: 0)
+- `--shutdown-timeout SECONDS` - Max seconds to wait for queue drain on shutdown (default: 300)
 
 **State Management:**
 Processed files are tracked in `<output-dir>/watch_state.json`. To reprocess all files, delete this file.
@@ -230,9 +234,17 @@ Multiple validation layers:
 - Retry logic with deterministic per-attempt seeding
 - Fallback strategies (longest transcript or highest similarity)
 
+### Queue-Based Processing (Watch Mode)
+The bulk TTS client uses a queue-based architecture in watch mode to ensure sequential processing:
+- `TTSProcessingQueue` class manages a thread-safe FIFO queue with a single worker thread
+- Detected files are enqueued instead of spawning concurrent threads
+- Only one file is processed at a time, respecting the single MODEL instance limitation
+- Queue status is displayed periodically (every 10 seconds) showing pending files and current file
+- Graceful shutdown drains the queue before exit (configurable timeout via `--shutdown-timeout`)
+
 ### Known Issues
 - faster-whisper may silently crash during validation (mentioned in README)
-- Single concurrent request limitation (shared MODEL between Gradio and API)
+- Single concurrent request limitation (shared MODEL between Gradio and API) - addressed by queue-based processing in watch mode
 - MPS (Apple Silicon GPU) support is incomplete/commented out
 
 ## File Output Naming Convention

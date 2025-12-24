@@ -24,6 +24,7 @@ import hashlib
 from datetime import datetime
 import signal
 import threading
+import queue
 
 try:
     from gradio_client import Client, handle_file
@@ -187,21 +188,125 @@ class GracefulShutdown:
         self.observer.stop()
 
 
+class TTSProcessingQueue:
+    """Thread-safe queue for sequential TTS file processing."""
+
+    def __init__(self, max_size: int = 0):
+        """
+        Initialize the processing queue.
+
+        Args:
+            max_size: Maximum queue size (0 = unlimited)
+        """
+        self.queue = queue.Queue(maxsize=max_size)
+        self.worker_thread = None
+        self.shutdown_event = threading.Event()
+        self.current_file = None
+        self.lock = threading.Lock()
+
+    def start_worker(self, process_callback):
+        """
+        Start the worker thread.
+
+        Args:
+            process_callback: Function to call for each file (receives Path object)
+        """
+        self.worker_thread = threading.Thread(
+            target=self._worker_loop,
+            args=(process_callback,),
+            daemon=False  # NOT daemon - want to finish processing
+        )
+        self.worker_thread.start()
+
+    def _worker_loop(self, process_callback):
+        """Main worker loop - processes files from queue sequentially."""
+        while not self.shutdown_event.is_set():
+            try:
+                # Block for 1 second to allow checking shutdown
+                file_path = self.queue.get(timeout=1.0)
+
+                with self.lock:
+                    self.current_file = file_path
+
+                try:
+                    process_callback(file_path)
+                except Exception as e:
+                    print(f"[QUEUE ERROR] {e}")
+                    import traceback
+                    traceback.print_exc()
+                finally:
+                    self.queue.task_done()
+                    with self.lock:
+                        self.current_file = None
+
+            except queue.Empty:
+                continue  # Timeout, check shutdown and continue
+
+    def enqueue(self, file_path: Path) -> bool:
+        """
+        Add file to processing queue.
+
+        Args:
+            file_path: Path to file to process
+
+        Returns:
+            True if enqueued successfully, False if queue is full
+        """
+        try:
+            self.queue.put(file_path, block=False)
+            size = self.queue.qsize()
+            print(f"[QUEUED] {file_path.name} (queue size: {size})")
+            return True
+        except queue.Full:
+            print(f"[QUEUE FULL] Cannot enqueue: {file_path.name}")
+            return False
+
+    def get_status(self) -> Dict[str, Any]:
+        """
+        Get current queue status.
+
+        Returns:
+            Dictionary with queue_size and current_file
+        """
+        with self.lock:
+            return {
+                'queue_size': self.queue.qsize(),
+                'current_file': self.current_file.name if self.current_file else None
+            }
+
+    def shutdown(self, timeout: int = 300):
+        """
+        Shutdown worker, waiting for queue to drain.
+
+        Args:
+            timeout: Max seconds to wait for queue drain
+        """
+        print(f"[QUEUE] Draining queue (up to {timeout}s timeout)...")
+        self.shutdown_event.set()
+
+        # Wait for current processing to complete
+        if self.worker_thread and self.worker_thread.is_alive():
+            self.worker_thread.join(timeout=timeout)
+
+        if self.worker_thread and self.worker_thread.is_alive():
+            print(f"[QUEUE] Warning: Worker thread still running after {timeout}s timeout")
+
+
 class TTSFileEventHandler(FileSystemEventHandler):
     """Handle file system events for TTS processing."""
 
     def __init__(self, client, output_dir, pattern, settings, tracker,
-                 watch_args, reference_audio=None, api_name=None, fn_index=None):
+                 watch_args, processing_queue, reference_audio=None, api_name=None, fn_index=None):
         self.client = client
         self.output_dir = output_dir
         self.pattern = pattern
         self.settings = settings
         self.tracker = tracker
         self.watch_args = watch_args
+        self.processing_queue = processing_queue
         self.reference_audio = reference_audio
         self.api_name = api_name
         self.fn_index = fn_index
-        self.processing_files = set()  # Prevent double-processing
 
         import fnmatch
         self.pattern_regex = fnmatch.translate(pattern)
@@ -217,10 +322,8 @@ class TTSFileEventHandler(FileSystemEventHandler):
 
         print(f"\n[DETECTED] New file: {file_path.name}")
 
-        # Process in separate thread to avoid blocking observer
-        thread = threading.Thread(target=self._process_file_safe, args=(file_path,))
-        thread.daemon = True
-        thread.start()
+        # Enqueue file for processing
+        self._enqueue_file(file_path)
 
     def on_modified(self, event):
         """Handle file modification events (if --reprocess-modified)."""
@@ -242,9 +345,8 @@ class TTSFileEventHandler(FileSystemEventHandler):
 
                 if current_hash != stored_info["hash"]:
                     print(f"\n[MODIFIED] File changed: {file_path.name}")
-                    thread = threading.Thread(target=self._process_file_safe, args=(file_path,))
-                    thread.daemon = True
-                    thread.start()
+                    # Enqueue file for processing
+                    self._enqueue_file(file_path)
             except (KeyError, OSError, FileNotFoundError):
                 pass  # Skip if can't compute hash or file not found
 
@@ -253,18 +355,21 @@ class TTSFileEventHandler(FileSystemEventHandler):
         import re
         return re.match(self.pattern_regex, file_path.name) is not None
 
-    def _process_file_safe(self, file_path: Path):
-        """Safely process a file with error handling and stability checks."""
-
-        file_key = str(file_path.absolute())
-        if file_key in self.processing_files:
-            print(f"[SKIP] Already processing: {file_path.name}")
+    def _enqueue_file(self, file_path: Path):
+        """Enqueue file for processing with pre-checks."""
+        # Pre-check: Already processed?
+        if self.tracker.is_processed(file_path) and \
+           not self.watch_args.get('reprocess_modified', False):
+            print(f"[SKIP] Already processed: {file_path.name}")
             return
 
-        self.processing_files.add(file_key)
+        # Enqueue the file
+        self.processing_queue.enqueue(file_path)
 
+    def _process_file_safe(self, file_path: Path):
+        """Safely process a file with error handling and stability checks."""
         try:
-            # Check if already processed
+            # Check if already processed (in case file was queued twice)
             if self.tracker.is_processed(file_path) and \
                not self.watch_args.get('reprocess_modified', False):
                 print(f"[SKIP] Already processed: {file_path.name}")
@@ -317,7 +422,6 @@ class TTSFileEventHandler(FileSystemEventHandler):
             self.tracker.mark_processed(file_path, False, [], str(e))
 
         finally:
-            self.processing_files.discard(file_key)
             print(f"\n[READY] Watching for new files...")
 
 
@@ -556,6 +660,10 @@ def run_watch_mode(client: Client, input_dir: str, output_dir: str, pattern: str
                       os.path.join(output_dir, 'watch_state.json'))
     tracker = ProcessedFilesTracker(state_file)
 
+    # Create processing queue
+    max_queue_size = watch_args.get('max_queue_size', 0)
+    processing_queue = TTSProcessingQueue(max_size=max_queue_size)
+
     # Create event handler
     handler = TTSFileEventHandler(
         client=client,
@@ -564,10 +672,14 @@ def run_watch_mode(client: Client, input_dir: str, output_dir: str, pattern: str
         settings=settings,
         tracker=tracker,
         watch_args=watch_args,
+        processing_queue=processing_queue,
         reference_audio=reference_audio,
         api_name=api_name,
         fn_index=fn_index
     )
+
+    # Start queue worker thread
+    processing_queue.start_worker(process_callback=handler._process_file_safe)
 
     # Start observer FIRST so it catches new files during initial scan
     observer = Observer()
@@ -587,7 +699,7 @@ def run_watch_mode(client: Client, input_dir: str, output_dir: str, pattern: str
 
     # Now process existing files (observer is already running)
     print(f"{'='*70}")
-    print("INITIAL SCAN - Processing existing files")
+    print("INITIAL SCAN - Enqueueing existing files")
     print(f"{'='*70}")
 
     input_path = Path(input_dir)
@@ -599,33 +711,10 @@ def run_watch_mode(client: Client, input_dir: str, output_dir: str, pattern: str
         if unprocessed_files:
             print(f"Found {len(unprocessed_files)} unprocessed file(s)\n")
 
-            for i, file_path in enumerate(unprocessed_files, 1):
-                print(f"[{i}/{len(unprocessed_files)}] Processing existing file: {file_path.name}")
-                try:
-                    output_files = process_text_file(
-                        client=client,
-                        text_file_path=str(file_path),
-                        output_dir=output_dir,
-                        settings=settings,
-                        audio_prompt_path=reference_audio,
-                        api_name=api_name,
-                        fn_index=fn_index
-                    )
+            for file_path in unprocessed_files:
+                processing_queue.enqueue(file_path)
 
-                    if output_files:
-                        print(f"[SUCCESS] Generated {len(output_files)} file(s)")
-                        tracker.mark_processed(file_path, True, output_files)
-                    else:
-                        print(f"[FAILED] No output generated")
-                        tracker.mark_processed(file_path, False, [], "No output files generated")
-
-                except Exception as e:
-                    print(f"[ERROR] Processing failed: {str(e)}")
-                    tracker.mark_processed(file_path, False, [], str(e))
-
-                print()
-
-            print(f"{'='*70}")
+            print(f"\n{'='*70}")
             print("Initial scan complete")
             print(f"{'='*70}\n")
         else:
@@ -640,22 +729,31 @@ def run_watch_mode(client: Client, input_dir: str, output_dir: str, pattern: str
 
     shutdown_handler = GracefulShutdown(observer)
 
+    # Track last status time for periodic updates
+    last_status_time = time.time()
+    status_interval = 10  # seconds
+
     try:
         while not shutdown_handler.shutdown:
             time.sleep(1)
+
+            # Periodic status updates
+            current_time = time.time()
+            if current_time - last_status_time >= status_interval:
+                status = processing_queue.get_status()
+                if status['queue_size'] > 0 or status['current_file']:
+                    msg = f"[STATUS] Queue: {status['queue_size']} pending"
+                    if status['current_file']:
+                        msg += f", processing: {status['current_file']}"
+                    print(msg)
+                last_status_time = current_time
+
     except KeyboardInterrupt:
         pass  # Handled by signal handler
     finally:
-        # Wait for active processing to complete
-        print("Waiting for active processing to complete...")
-        timeout = 30
-        start_wait = time.time()
-
-        while handler.processing_files and (time.time() - start_wait < timeout):
-            time.sleep(0.5)
-
-        if handler.processing_files:
-            print(f"Warning: {len(handler.processing_files)} file(s) still processing")
+        # Shutdown queue and wait for completion
+        queue_timeout = watch_args.get('shutdown_timeout', 300)
+        processing_queue.shutdown(timeout=queue_timeout)
 
         observer.join(timeout=5)
         print("Watch mode stopped.")
@@ -790,6 +888,20 @@ Examples:
         help='Watch subdirectories recursively (default: false)'
     )
 
+    parser.add_argument(
+        '--max-queue-size',
+        type=int,
+        default=0,
+        help='Maximum queue size (0 = unlimited, default: 0)'
+    )
+
+    parser.add_argument(
+        '--shutdown-timeout',
+        type=int,
+        default=300,
+        help='Max seconds to wait for queue drain on shutdown (default: 300)'
+    )
+
     args = parser.parse_args()
 
     # If --list-endpoints is specified, we don't need input/output dirs
@@ -880,7 +992,9 @@ Examples:
                 'stability_interval': args.stability_interval,
                 'state_file': args.watch_state_file,
                 'reprocess_modified': args.reprocess_modified,
-                'recursive': args.watch_recursive
+                'recursive': args.watch_recursive,
+                'max_queue_size': args.max_queue_size,
+                'shutdown_timeout': args.shutdown_timeout
             }
 
             # Run watch mode

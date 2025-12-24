@@ -243,12 +243,17 @@ if "DEVICE" in os.environ:
     DEVICE = os.environ["DEVICE"]
 elif torch.cuda.is_available():
     DEVICE = "cuda"
-#elif torch.backends.mps.is_available():
-#    DEVICE = "mps"
+elif torch.backends.mps.is_available():
+    DEVICE = "mps"
 else:
     DEVICE = "cpu"
 
-print(f"🚀 Running on device: {DEVICE}")
+if DEVICE == "mps":
+    WHISPER_DEVICE = "cpu"
+else:
+    WHISPER_DEVICE = DEVICE
+
+print(f"🚀 Running on device: {DEVICE} - {WHISPER_DEVICE}")
 # ---- Determinism (CUDA / PyTorch) ----
 import os as _os, torch as _torch
 _torch.backends.cudnn.benchmark = False
@@ -1188,7 +1193,7 @@ def process_text_for_tts(
             _free_vram()
 
             model_key = whisper_model_map.get(whisper_model_name, "medium")
-            whisper_model = load_whisper_backend(model_key, use_faster_whisper, DEVICE)
+            whisper_model = load_whisper_backend(model_key, use_faster_whisper, WHISPER_DEVICE)
 
             try:
                 all_candidates = []
